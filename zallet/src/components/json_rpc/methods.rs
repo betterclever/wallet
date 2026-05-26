@@ -564,54 +564,51 @@ pub(crate) trait WalletRpc {
         privacy_policy: Option<String>,
     ) -> z_send_many::Response;
 
-    /// Shields coinbase UTXOs by sending them from a transparent address (or all
-    /// wallet taddrs) to a shielded address within the same account.
+    /// Shields coinbase UTXOs from a single wallet-owned source into a
+    /// shielded address.
     ///
-    /// This is an asynchronous operation; it returns an operation ID that can
-    /// be used with `z_getoperationstatus` or `z_getoperationresult`.
-    ///
-    /// **Note:** This method's behavior differs from `zcashd`. The `toaddress`
-    /// must be a wallet-owned shielded address and is used to select the account
-    /// whose transparent UTXOs will be shielded. The resulting transaction sends
-    /// funds to the account's internal shielded address, which may differ from
-    /// `toaddress`. The `fromaddress` must also belong to the same account.
+    /// This is an asynchronous operation; it returns an operation id that
+    /// can be used with `z_getoperationstatus` or `z_getoperationresult`.
     ///
     /// # Arguments
-    /// - `fromaddress` (string, required): A wallet-owned transparent address to
-    ///   sweep from, or `"*"` to sweep from all taddrs belonging to the same
-    ///   account as `toaddress`. Must belong to the same account as `toaddress`.
-    /// - `toaddress` (string, required): A wallet-owned shielded address (Sapling,
-    ///   Orchard, or Unified with shielded receivers) used to identify the account.
-    ///   Funds are shielded into the account's internal shielded address, which may
-    ///   differ from this address.
-    /// - `fee` (optional): This parameter must be omitted or set to `null`;
-    ///   any other value will be rejected. When accepted, the value of this field
-    ///   is ignored, as Zallet always calculates and applies the ZIP-317 fee
-    ///   internally.
-    /// - `limit` (numeric, optional): If supplied, caps the number of selected
-    ///   coinbase UTXOs to the highest-value `n` of those eligible. Recommended
-    ///   for wallets with many eligible coinbase UTXOs: without it, a single
-    ///   transaction is built containing all eligible UTXOs, which can exceed
-    ///   transaction-size limits at broadcast time. Zallet logs a warning (but
-    ///   does not enforce a hard cap) when the proposal selects more than ~400
-    ///   inputs.
-    /// - `memo` (string, optional): If supplied, stored in the memo field of
-    ///   the resulting shielded payment. Must be a hex-encoded string (up to
-    ///   1024 hex characters = 512 bytes).
-    /// - `privacy_policy` (string, optional): Policy for what information
-    ///   leakage is acceptable.
+    /// - `fromaddress`: Either a single transparent address owned by this
+    ///   wallet, or an account UUID (string) to sweep every coinbase UTXO
+    ///   across that account's transparent receivers. Arrays of addresses
+    ///   are not accepted; pass the account UUID instead if you need to
+    ///   sweep across multiple receivers.
+    /// - `toaddress`: Any Zcash shielded address (Sapling, Orchard, or
+    ///   Unified with a shielded receiver) that will receive the shielded
+    ///   funds. Need not belong to this wallet. Transparent / TEX
+    ///   destinations are rejected by the backend.
+    /// - `fee` (numeric, optional): If set, it must be null. Zallet always
+    ///   uses a fee calculated according to ZIP 317; the parameter is
+    ///   accepted for positional compatibility with `zcashd`'s
+    ///   `z_shieldcoinbase` only.
+    /// - `limit` (numeric, optional): If supplied, caps the number of
+    ///   selected coinbase UTXOs to the highest-value `n` of those
+    ///   eligible. Recommended for wallets with many eligible coinbase
+    ///   UTXOs: without it, a single transaction is built containing all
+    ///   eligible UTXOs, which can exceed transaction-size limits at
+    ///   broadcast time.
+    /// - `memo` (string, optional): If supplied, stored in the memo field
+    ///   of the resulting shielded payment. Hex-encoded, up to 1024 hex
+    ///   characters (= 512 bytes).
+    /// - `privacy_policy` (string, optional): If set, it must be null.
+    ///   Zallet always shields under a fixed privacy policy that allows
+    ///   the unavoidable on-chain linkage between the source transparent
+    ///   address(es) and the resulting shielded output; the parameter is
+    ///   accepted for positional compatibility with `zcashd`'s
+    ///   `z_shieldcoinbase` only.
     ///
     /// # Returns
     /// An object matching `zcashd`'s `z_shieldcoinbase` shape:
-    /// - `remainingUTXOs` (numeric): Number of coinbase UTXOs eligible for
-    ///   shielding that were not selected. Non-zero when `limit` is smaller
-    ///   than the count of eligible coinbase UTXOs.
+    /// - `remainingUTXOs` (numeric): Eligible-but-not-selected coinbase UTXO
+    ///   count.
     /// - `remainingValue` (numeric, ZEC): Total value of those UTXOs.
-    /// - `shieldingUTXOs` (numeric): Number of coinbase UTXOs being shielded
-    ///   by this operation.
+    /// - `shieldingUTXOs` (numeric): Number of coinbase UTXOs being
+    ///   shielded by this operation.
     /// - `shieldingValue` (numeric, ZEC): Total value being shielded.
-    /// - `opid` (string): Operation id to pass to `z_getoperationstatus` or
-    ///   `z_getoperationresult` to retrieve the final result.
+    /// - `opid` (string): Operation id.
     #[method(name = "z_shieldcoinbase")]
     async fn z_shieldcoinbase(
         &self,

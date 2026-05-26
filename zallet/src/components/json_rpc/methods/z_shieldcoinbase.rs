@@ -9,33 +9,32 @@ use schemars::JsonSchema;
 use secrecy::ExposeSecret;
 use serde::Serialize;
 use transparent::address::TransparentAddress;
+use uuid::Uuid;
 use zaino_state::FetchServiceSubscriber;
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
-        Account, InputSource, TransparentOutputFilter, WalletRead,
+        Account as _, InputSource, TransparentOutputFilter, WalletRead,
         wallet::{
-            SpendingKeys, create_proposed_transactions, input_selection::GreedyInputSelector,
-            propose_shielding_coinbase,
+            ConfirmationsPolicy, SpendingKeys, TargetHeight, create_proposed_transactions,
+            input_selection::GreedyInputSelector, propose_shielding_coinbase,
         },
     },
     fees::StandardFeeRule,
     proposal::Proposal,
     wallet::OvkPolicy,
 };
+use zcash_client_sqlite::AccountUuid;
 use zcash_keys::{address::Address, keys::UnifiedSpendingKey};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::value::Zatoshis;
 
 use crate::{
     components::{
-        database::DbHandle,
+        database::{DbConnection, DbHandle},
         json_rpc::{
             asyncop::{ContextInfo, OperationId},
-            payments::{
-                PrivacyPolicy, SendResult, broadcast_transactions, enforce_privacy_policy,
-                get_account_for_address, parse_memo,
-            },
+            payments::{PrivacyPolicy, SendResult, broadcast_transactions, parse_memo},
             server::LegacyCode,
             utils::{JsonZec, value_from_zatoshis},
         },
@@ -45,12 +44,15 @@ use crate::{
 };
 
 #[cfg(feature = "transparent-key-import")]
+use std::collections::{HashMap, HashSet};
+#[cfg(feature = "transparent-key-import")]
+use zcash_client_backend::wallet::TransparentAddressSource;
+#[cfg(feature = "transparent-key-import")]
 use zcash_script::script;
 
 /// The result of a `z_shieldcoinbase` pre-flight call.
 ///
 /// Mirrors the JSON object returned by `zcashd`'s `z_shieldcoinbase`:
-/// `{ remainingUTXOs, remainingValue, shieldingUTXOs, shieldingValue, opid }`.
 #[derive(Clone, Debug, Serialize, Documented, JsonSchema)]
 pub(crate) struct ShieldCoinbaseResult {
     /// Number of coinbase UTXOs that were eligible for shielding but were not
@@ -93,6 +95,9 @@ impl ShieldCoinbaseResult {
     }
 }
 
+pub(crate) type ResultType = ShieldCoinbaseResult;
+pub(crate) type Response = RpcResult<ResultType>;
+
 /// Pre-flight numeric fields, computed before the async portion runs.
 ///
 /// Held as a separate type so that the [`OperationId`] (only available after
@@ -105,32 +110,24 @@ pub(crate) struct Preflight {
     pub(super) shielding_value: JsonZec,
 }
 
-pub(crate) type ResultType = ShieldCoinbaseResult;
-pub(crate) type Response = RpcResult<ResultType>;
-
-pub(super) const PARAM_FROMADDRESS_DESC: &str = "A wallet-owned transparent address to sweep from, or \"*\" to sweep from all taddrs \
-     belonging to the same account as toaddress. Must belong to the same account as toaddress.";
-pub(super) const PARAM_TOADDRESS_DESC: &str = "A wallet-owned shielded address used to identify the account. Funds are shielded into \
-     the account's internal shielded address, which may differ from this address.";
+pub(super) const PARAM_FROMADDRESS_DESC: &str = "Source of coinbase UTXOs to shield. Either a single transparent address owned by this \
+     wallet, or an account UUID to sweep every coinbase UTXO across that account's transparent \
+     receivers.";
+pub(super) const PARAM_TOADDRESS_DESC: &str = "Any Zcash shielded address (Sapling, Orchard, or Unified with a shielded receiver) that \
+     will receive the shielded funds. Need not belong to this wallet. Transparent or TEX \
+     destinations are rejected.";
 pub(super) const PARAM_FEE_DESC: &str =
     "If provided, must be null. Zallet always calculates and applies the ZIP-317 fee internally.";
 pub(super) const PARAM_LIMIT_DESC: &str = "If supplied, caps the number of selected coinbase UTXOs to the highest-value `n` of those \
      eligible. Recommended for wallets with many eligible coinbase UTXOs: without it, a single \
      transaction is built containing all eligible UTXOs, which can exceed transaction-size \
-     limits at broadcast time. Zallet logs a warning (but does not enforce a hard cap) when \
-     the proposal selects more than ~400 inputs.";
+     limits at broadcast time.";
 pub(super) const PARAM_MEMO_DESC: &str = "If supplied, stored in the memo field of the resulting shielded payment. Must be a \
      hex-encoded string (up to 1024 hex characters = 512 bytes).";
-pub(super) const PARAM_PRIVACY_POLICY_DESC: &str =
-    "Policy for what information leakage is acceptable.";
+pub(super) const PARAM_PRIVACY_POLICY_DESC: &str = "If set, it must be null.";
 
 /// Soft threshold above which [`call`] emits a `warn!` log about potential
 /// transaction-size issues at broadcast time.
-///
-/// Not enforced as a hard limit: callers may legitimately want to drain a long
-/// tail of small coinbase UTXOs in a single call. The escape hatch for callers
-/// who hit broadcast-size issues is the `limit` RPC parameter, which shields
-/// the highest-value `n` UTXOs and leaves the rest for a subsequent call.
 pub(super) const COINBASE_INPUTS_WARN_THRESHOLD: u64 = 400;
 
 #[allow(clippy::too_many_arguments)]
@@ -149,111 +146,51 @@ pub(crate) async fn call(
     Option<ContextInfo>,
     impl Future<Output = RpcResult<SendResult>>,
 )> {
-    // Validate fee: Zallet always uses ZIP-317 fees internally.
+    // `fee` and `privacy_policy` exist for positional compatibility with
+    // `zcashd`'s `z_shieldcoinbase` only — Zallet always computes the fee
+    // internally and always shields under a fixed privacy policy. Reject any
+    // non-null value so callers can't silently believe they're configuring
+    // either.
     if fee.is_some() {
         return Err(LegacyCode::InvalidParameter
             .with_static("Zallet always calculates fees internally; the fee field must be null."));
     }
+    if privacy_policy.is_some() {
+        return Err(LegacyCode::InvalidParameter.with_static(
+            "Zallet does not support configuring the privacy policy for z_shieldcoinbase; \
+             the privacy_policy field must be null.",
+        ));
+    }
 
-    // Parse the privacy policy.
-    // Default to AllowRevealedSenders since shielding always reveals the transparent sender.
-    let privacy_policy = match privacy_policy.as_deref() {
-        Some("LegacyCompat") => Err(LegacyCode::InvalidParameter
-            .with_static("LegacyCompat privacy policy is unsupported in Zallet")),
-        Some(s) => PrivacyPolicy::from_str(s).ok_or_else(|| {
-            LegacyCode::InvalidParameter.with_message(format!("Unknown privacy policy {s}"))
-        }),
-        None => Ok(PrivacyPolicy::AllowRevealedSenders),
-    }?;
-
-    // Parse the memo parameter (hex-encoded). The backend will attach it to the
-    // resulting shielded payment. The backend rejects memos longer than 512 bytes
-    // by way of `MemoBytes::from_bytes`.
-    let memo = memo.as_deref().map(parse_memo).transpose()?;
-
-    // The `limit` parameter caps the number of selected coinbase UTXOs to the
-    // highest-value `n` of those eligible.
-    let limit_usize = limit.map(|n| n as usize);
-
-    // Parse and validate the destination address. We need both:
-    // - a `ZcashAddress` to pass to `propose_shielding_coinbase` (the backend's
-    //   shielded-receiver enforcement runs against this value).
-    // - a `zcash_keys::address::Address` to call `get_account_for_address` and
-    //   anchor the zallet-level same-account constraint: zallet's
-    //   `z_shieldcoinbase` requires `toaddress` to belong to a wallet account
-    //   (matching `zcashd`'s behavior), on top of the backend's requirement
-    //   that it be shielded.
-    let to_address = Address::decode(wallet.params(), &toaddress).ok_or_else(|| {
-        LegacyCode::InvalidParameter.with_message(format!(
-            "Invalid parameter, unknown address format: {toaddress}"
-        ))
-    })?;
+    // Parse the destination address.
     let to_zcash_address: ZcashAddress = toaddress.parse().map_err(|_| {
         LegacyCode::InvalidParameter.with_message(format!(
             "Invalid parameter, unknown address format: {toaddress}"
         ))
     })?;
 
-    // Look up the account that owns the destination address. This enforces the
-    // zallet-level "same account" requirement; the backend additionally
-    // enforces "must be a shielded address" via
-    // `ProposalError::ShieldingRequiresShieldedRecipient`.
-    let account = get_account_for_address(wallet.as_ref(), &to_address)?;
+    // Parse the memo parameter (hex-encoded).
+    let memo = memo.as_deref().map(parse_memo).transpose()?;
+    let limit_usize = limit.map(|n| n as usize);
 
-    // Resolve the transparent source addresses.
-    let from_addrs: Vec<TransparentAddress> = if fromaddress == "*" {
-        wallet
-            .get_transparent_receivers(account.id(), true, true)
-            .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?
-            .into_keys()
-            .collect()
-    } else {
-        // Parse as a transparent address. z_shieldcoinbase only accepts transparent
-        // source addresses (or "*").
-        let from_address = Address::decode(wallet.params(), &fromaddress).ok_or_else(|| {
-            LegacyCode::InvalidAddressOrKey
-                .with_static("Invalid from address: should be a taddr or the string \"*\".")
-        })?;
-
-        let transparent_addr: TransparentAddress = match from_address {
-            Address::Transparent(addr) => addr,
-            // Don't allow tex addresses, just as zcashd doesn't allow tex addresses.
-            // It would mostly likely be a mistake if the user specifies a tex address here, so we'll err.
-            _ => {
-                return Err(LegacyCode::InvalidAddressOrKey.with_static(
-                    "Invalid from address: z_shieldcoinbase only supports transparent source addresses.",
-                ));
-            }
-        };
-
-        // Verify the transparent address belongs to the same account as toaddress.
-        let from_account =
-            get_account_for_address(wallet.as_ref(), &Address::Transparent(transparent_addr))?;
-        if from_account.id() != account.id() {
-            return Err(LegacyCode::InvalidParameter.with_static(
-                "Invalid parameter: fromaddress and toaddress must belong to the same account.",
-            ));
-        }
-
-        vec![transparent_addr]
-    };
+    // Resolve `fromaddress` to the source account + its source transparent
+    // addresses (one address for a t-addr input, all account receivers for a
+    // UUID input).
+    let (account_id, from_addrs) = resolve_fromaddress(wallet.as_ref(), &fromaddress)?;
 
     if from_addrs.is_empty() {
-        return Err(
-            LegacyCode::InvalidParameter.with_static("No transparent addresses found to shield.")
-        );
+        return Err(LegacyCode::InvalidParameter
+            .with_static("No source transparent addresses resolved from `fromaddress`."));
     }
 
-    // Set up confirmations policy from the wallet configuration.
-    let confirmations_policy = APP.config().builder.confirmations_policy().map_err(|_| {
-        LegacyCode::Wallet.with_message(
-            "Configuration error: minimum confirmations for spending trusted TXOs \
-             cannot exceed that for untrusted TXOs.",
-        )
-    })?;
+    let account = wallet
+        .get_account(account_id)
+        .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?
+        .ok_or_else(|| {
+            LegacyCode::Database.with_message(format!("Account vanished mid-call: {account_id:?}"))
+        })?;
 
     let params = *wallet.params();
-
     let input_selector = GreedyInputSelector::new();
 
     // Create the shielding proposal. Uses Zatoshis::ZERO as the shielding
@@ -278,59 +215,20 @@ pub(crate) async fn call(
         LegacyCode::Wallet.with_message(format!("Failed to propose shielding transaction: {e}"))
     })?;
 
-    enforce_privacy_policy(&proposal, privacy_policy)?;
+    // The shielding operation always reveals the transparent sender(s). When the caller asks us to
+    // sweep multiple source addresses (i.e. via an account UUID expanded to >1 receivers), the
+    // resulting transaction also links those addresses on-chain, so we must additionally allow
+    // that.
+    crate::components::json_rpc::payments::enforce_privacy_policy(
+        &proposal,
+        PrivacyPolicy::AllowLinkingAccountAddresses,
+    )?;
 
-    // Compute the `zcashd`-shape pre-flight numbers.
-    //
-    // `shielding_*` is what the proposal will spend; we sum directly over the
-    // proposal's selected transparent inputs.
-    //
-    // `remaining_*` is what was eligible-but-not-selected. We re-enumerate the
-    // spendable coinbase UTXOs for `from_addrs` at the same target height the
-    // proposal used and subtract.
-    //
-    // RACE NOTE: Between `propose_shielding` (above) and the enumeration
-    // below, a new block could land and either advance maturity (adding new
-    // eligible UTXOs) or invalidate previously-eligible ones via reorg. In
-    // the first case `total_value` only inflates, leaving
-    // `shielding_value <= total_value`; the subtraction is safe and
-    // `remaining_*` will harmlessly over-count by the freshly-mature outputs.
-    // In the (rare) reorg case, `shielding_value > total_value` is possible.
-    // We treat that as an internal error and abort before registering the
-    // opid, so no half-state is exposed to the caller.
-    let mut shielding_utxos: u64 = 0;
-    let mut shielding_value_zats = Zatoshis::ZERO;
-    for step in proposal.steps() {
-        for utxo in step.transparent_inputs() {
-            shielding_utxos = shielding_utxos.saturating_add(1);
-            shielding_value_zats = (shielding_value_zats + utxo.value()).ok_or_else(|| {
-                LegacyCode::Wallet
-                    .with_static("Internal error: shielding value sum overflowed Zatoshis bounds.")
-            })?;
-        }
-    }
-
+    // Pre-flight numerics
+    let (shielding_utxos, shielding_value_zats) = sum_selected_inputs(&proposal)?;
     let target_height = proposal.min_target_height();
-    let mut total_utxos: u64 = 0;
-    let mut total_value_zats = Zatoshis::ZERO;
-    for addr in &from_addrs {
-        let utxos = wallet
-            .get_spendable_transparent_outputs(
-                addr,
-                target_height,
-                confirmations_policy,
-                TransparentOutputFilter::CoinbaseOnly,
-            )
-            .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?;
-        total_utxos = total_utxos.saturating_add(utxos.len() as u64);
-        for utxo in utxos {
-            total_value_zats = (total_value_zats + utxo.value()).ok_or_else(|| {
-                LegacyCode::Wallet.with_static(
-                    "Internal error: total transparent value overflowed Zatoshis bounds.",
-                )
-            })?;
-        }
-    }
+    let (total_utxos, total_value_zats) =
+        enumerate_eligible(wallet.as_mut(), &from_addrs, target_height)?;
 
     let remaining_utxos = total_utxos.checked_sub(shielding_utxos).ok_or_else(|| {
         LegacyCode::Wallet.with_static(
@@ -340,27 +238,11 @@ pub(crate) async fn call(
     })?;
     let remaining_value_zats = (total_value_zats - shielding_value_zats).ok_or_else(|| {
         LegacyCode::Wallet.with_static(
-            "Internal accounting error: proposal value exceeds enumerated \
-                 total (likely a chain race during shielding setup).",
+            "Internal accounting error: proposal value exceeds enumerated total \
+             (likely a chain race during shielding setup).",
         )
     })?;
 
-    let preflight = Preflight {
-        remaining_utxos,
-        remaining_value: value_from_zatoshis(remaining_value_zats),
-        shielding_utxos,
-        shielding_value: value_from_zatoshis(shielding_value_zats),
-    };
-
-    // `propose_shielding_coinbase` always produces a single shielded output (0 or
-    // 1 Orchard action), so there is no Orchard-actions ceiling to check here.
-    //
-    // We do however emit a soft warning when the transparent-input count is
-    // large. There is no consensus-level cap on transparent inputs, but a tx
-    // with many P2PKH inputs may exceed network/mempool size policy and be
-    // rejected at broadcast. We don't enforce a hard limit because the caller
-    // may legitimately want to drain a long tail in a single call; supplying
-    // the `limit` parameter is the documented escape hatch.
     if shielding_utxos > COINBASE_INPUTS_WARN_THRESHOLD {
         warn!(
             "z_shieldcoinbase: proposal selected {} coinbase UTXOs, which exceeds the \
@@ -371,19 +253,24 @@ pub(crate) async fn call(
         );
     }
 
-    // Derive the spending key for the account.
-    let derivation = account.source().key_derivation().ok_or_else(|| {
-        LegacyCode::InvalidAddressOrKey
-            .with_static("Invalid address, no payment source found for account.")
-    })?;
+    let preflight = Preflight {
+        remaining_utxos,
+        remaining_value: value_from_zatoshis(remaining_value_zats),
+        shielding_utxos,
+        shielding_value: value_from_zatoshis(shielding_value_zats),
+    };
 
-    // Fetch spending key last, to avoid a keystore decryption if unnecessary.
+    // Derive the spending key for the source account.
+    let derivation = account.source().key_derivation().ok_or_else(|| {
+        LegacyCode::InvalidAddressOrKey.with_message(format!(
+            "No payment source found for account {}.",
+            account_id.expose_uuid(),
+        ))
+    })?;
     let seed = keystore
         .decrypt_seed(derivation.seed_fingerprint())
         .await
         .map_err(|e| match e.kind() {
-            // TODO: Improve internal error types.
-            //       https://github.com/zcash/wallet/issues/256
             crate::error::ErrorKind::Generic if e.to_string() == "Wallet is locked" => {
                 LegacyCode::WalletUnlockNeeded.with_message(e.to_string())
             }
@@ -397,56 +284,8 @@ pub(crate) async fn call(
     .map_err(|e| LegacyCode::InvalidAddressOrKey.with_message(e.to_string()))?;
 
     #[cfg(feature = "transparent-key-import")]
-    let standalone_keys = {
-        // Determine which transparent receivers in this account were imported
-        // standalone (vs. HD-derived). Only those have an associated entry in
-        // the keystore's standalone-key table; HD-derived receivers are signed
-        // for using `usk` and must not be looked up via
-        // `decrypt_standalone_transparent_key` (which would error with
-        // `QueryReturnedNoRows`).
-        use zcash_client_backend::wallet::TransparentAddressSource;
-        let standalone_addrs: std::collections::HashSet<TransparentAddress> = wallet
-            .get_transparent_receivers(account.id(), true, true)
-            .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?
-            .into_iter()
-            .filter_map(|(addr, metadata)| match metadata.source() {
-                TransparentAddressSource::StandalonePubkey(_)
-                | TransparentAddressSource::StandaloneScript(_) => Some(addr),
-                TransparentAddressSource::Derived { .. } => None,
-            })
-            .collect();
-
-        let mut keys: std::collections::HashMap<TransparentAddress, Vec<secp256k1::SecretKey>> =
-            std::collections::HashMap::new();
-        for step in proposal.steps() {
-            for input in step.transparent_inputs() {
-                if let Some(address) = script::FromChain::parse(&input.txout().script_pubkey().0)
-                    .ok()
-                    .as_ref()
-                    .and_then(TransparentAddress::from_script_from_chain)
-                {
-                    if !standalone_addrs.contains(&address) {
-                        continue;
-                    }
-                    let secret_key = keystore
-                        .decrypt_standalone_transparent_key(&address)
-                        .await
-                        .map_err(|e| match e.kind() {
-                            // TODO: Improve internal error types.
-                            //       https://github.com/zcash/wallet/issues/256
-                            crate::error::ErrorKind::Generic
-                                if e.to_string() == "Wallet is locked" =>
-                            {
-                                LegacyCode::WalletUnlockNeeded.with_message(e.to_string())
-                            }
-                            _ => LegacyCode::Database.with_message(e.to_string()),
-                        })?;
-                    keys.entry(address).or_default().push(secret_key);
-                }
-            }
-        }
-        keys
-    };
+    let standalone_keys =
+        collect_standalone_keys(wallet.as_mut(), &keystore, account_id, &proposal).await?;
 
     Ok((
         preflight,
@@ -464,18 +303,185 @@ pub(crate) async fn call(
             proposal,
             SpendingKeys::new(
                 usk,
-                #[cfg(feature = "zcashd-import")]
+                #[cfg(feature = "transparent-key-import")]
                 standalone_keys,
             ),
         ),
     ))
 }
 
-/// Construct and broadcast the shielding transaction.
+/// Classified form of the `fromaddress` parameter. Pure-function output of
+/// [`parse_fromaddress`], split out from the DB-touching
+/// [`resolve_fromaddress`] so the parsing rules can be unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FromAddressInput {
+    /// An account UUID: sweep every transparent receiver in this account.
+    AccountUuid(Uuid),
+    /// A wallet-owned transparent address: shield coinbase UTXOs at exactly
+    /// this address.
+    TransparentAddress(TransparentAddress),
+}
+
+/// Classify the string form of `fromaddress` as either an account UUID or a
+/// transparent address, without touching the wallet database.
 ///
-/// Notes:
-/// 1. Spendable notes/UTXOs are not locked, so an operation running in parallel
-///    could also try to use them.
+/// UUIDs and Zcash transparent addresses use disjoint string forms (UUIDs are
+/// hex with dashes at fixed positions; transparent addresses are base58check
+/// with a leading `t1` / `t2` / `t3` / `tm`), so the parse order is safe.
+pub(super) fn parse_fromaddress(
+    params: &crate::network::Network,
+    fromaddress: &str,
+) -> RpcResult<FromAddressInput> {
+    if let Ok(uuid) = Uuid::parse_str(fromaddress) {
+        return Ok(FromAddressInput::AccountUuid(uuid));
+    }
+    match Address::decode(params, fromaddress) {
+        Some(Address::Transparent(addr)) => Ok(FromAddressInput::TransparentAddress(addr)),
+        Some(_) => Err(LegacyCode::InvalidAddressOrKey.with_message(format!(
+            "Invalid `fromaddress`: only transparent addresses are accepted (got a \
+             non-transparent Zcash address): {fromaddress}",
+        ))),
+        None => Err(LegacyCode::InvalidParameter.with_message(format!(
+            "Invalid `fromaddress`: expected a wallet-owned transparent address or an \
+             account UUID, got {fromaddress:?}",
+        ))),
+    }
+}
+
+/// Resolve `fromaddress` to a source account and the transparent addresses
+/// to draw coinbase UTXOs from.
+///
+/// Accepted shapes:
+/// * a wallet-owned transparent address — selects only that address.
+/// * an account UUID — selects every transparent receiver in that account.
+fn resolve_fromaddress(
+    wallet: &DbConnection,
+    fromaddress: &str,
+) -> RpcResult<(AccountUuid, Vec<TransparentAddress>)> {
+    match parse_fromaddress(wallet.params(), fromaddress)? {
+        FromAddressInput::AccountUuid(uuid) => {
+            let account_id = AccountUuid::from_uuid(uuid);
+            if wallet
+                .get_account(account_id)
+                .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?
+                .is_none()
+            {
+                return Err(LegacyCode::InvalidParameter
+                    .with_message(format!("Unknown account UUID: {fromaddress}")));
+            }
+            let from_addrs = wallet
+                .get_transparent_receivers(account_id, true, true)
+                .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?
+                .into_keys()
+                .collect();
+            Ok((account_id, from_addrs))
+        }
+        FromAddressInput::TransparentAddress(addr) => {
+            let owner = wallet
+                .find_account_for_address(wallet.params(), &Address::Transparent(addr))
+                .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?
+                .ok_or_else(|| {
+                    LegacyCode::InvalidAddressOrKey.with_message(format!(
+                        "Transparent address is not owned by any account in this wallet: \
+                         {fromaddress}",
+                    ))
+                })?;
+            Ok((owner, vec![addr]))
+        }
+    }
+}
+
+fn sum_selected_inputs(
+    proposal: &Proposal<StandardFeeRule, Infallible>,
+) -> RpcResult<(u64, Zatoshis)> {
+    let mut count: u64 = 0;
+    let mut sum = Zatoshis::ZERO;
+    for step in proposal.steps() {
+        for utxo in step.transparent_inputs() {
+            count = count.saturating_add(1);
+            sum = (sum + utxo.value()).ok_or_else(|| {
+                LegacyCode::Wallet
+                    .with_static("Internal error: shielding value sum overflowed Zatoshis bounds.")
+            })?;
+        }
+    }
+    Ok((count, sum))
+}
+
+fn enumerate_eligible(
+    wallet: &mut DbConnection,
+    from_addrs: &[TransparentAddress],
+    target_height: TargetHeight,
+) -> RpcResult<(u64, Zatoshis)> {
+    let mut total_utxos: u64 = 0;
+    let mut total_value_zats = Zatoshis::ZERO;
+    for addr in from_addrs {
+        let utxos = wallet
+            .get_spendable_transparent_outputs(
+                addr,
+                target_height,
+                ConfirmationsPolicy::MIN,
+                TransparentOutputFilter::CoinbaseOnly,
+            )
+            .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?;
+        total_utxos = total_utxos.saturating_add(utxos.len() as u64);
+        for utxo in utxos {
+            total_value_zats = (total_value_zats + utxo.value()).ok_or_else(|| {
+                LegacyCode::Wallet.with_static(
+                    "Internal error: total transparent value overflowed Zatoshis bounds.",
+                )
+            })?;
+        }
+    }
+    Ok((total_utxos, total_value_zats))
+}
+
+#[cfg(feature = "transparent-key-import")]
+async fn collect_standalone_keys(
+    wallet: &mut DbConnection,
+    keystore: &KeyStore,
+    account_id: AccountUuid,
+    proposal: &Proposal<StandardFeeRule, Infallible>,
+) -> RpcResult<HashMap<TransparentAddress, Vec<secp256k1::SecretKey>>> {
+    let standalone_addrs: HashSet<TransparentAddress> = wallet
+        .get_transparent_receivers(account_id, true, true)
+        .map_err(|e| LegacyCode::Database.with_message(e.to_string()))?
+        .into_iter()
+        .filter_map(|(addr, metadata)| match metadata.source() {
+            TransparentAddressSource::StandalonePubkey(_)
+            | TransparentAddressSource::StandaloneScript(_) => Some(addr),
+            TransparentAddressSource::Derived { .. } => None,
+        })
+        .collect();
+
+    let mut keys: HashMap<TransparentAddress, Vec<secp256k1::SecretKey>> = HashMap::new();
+    for step in proposal.steps() {
+        for input in step.transparent_inputs() {
+            if let Some(address) = script::FromChain::parse(&input.txout().script_pubkey().0)
+                .ok()
+                .as_ref()
+                .and_then(TransparentAddress::from_script_from_chain)
+            {
+                if !standalone_addrs.contains(&address) {
+                    continue;
+                }
+                let secret_key = keystore
+                    .decrypt_standalone_transparent_key(&address)
+                    .await
+                    .map_err(|e| match e.kind() {
+                        crate::error::ErrorKind::Generic if e.to_string() == "Wallet is locked" => {
+                            LegacyCode::WalletUnlockNeeded.with_message(e.to_string())
+                        }
+                        _ => LegacyCode::Database.with_message(e.to_string()),
+                    })?;
+                keys.entry(address).or_default().push(secret_key);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// Construct and broadcast the shielding transaction.
 async fn run(
     mut wallet: DbHandle,
     chain: FetchServiceSubscriber,
@@ -505,4 +511,91 @@ async fn run(
     })?;
 
     broadcast_transactions(&wallet, chain, txids.into()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::json_rpc::server::LegacyCode;
+    use crate::network::Network;
+    use zcash_protocol::consensus;
+
+    fn mainnet() -> Network {
+        Network::Consensus(consensus::Network::MainNetwork)
+    }
+
+    fn testnet() -> Network {
+        Network::Consensus(consensus::Network::TestNetwork)
+    }
+
+    // Reused from validate_address.rs tests.
+    const MAINNET_P2PKH: &str = "t1VydNnkjBzfL1iAMyUbwGKJAF7PgvuCfMY";
+    const MAINNET_P2SH: &str = "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd";
+    const TESTNET_P2PKH: &str = "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86";
+    // Reused from validate_address.rs:160.
+    const MAINNET_SAPLING: &str =
+        "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9slya";
+
+    const VALID_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    #[test]
+    fn uuid_classified_as_account_uuid() {
+        let parsed = parse_fromaddress(&mainnet(), VALID_UUID).unwrap();
+        let expected_uuid = Uuid::parse_str(VALID_UUID).unwrap();
+        assert_eq!(parsed, FromAddressInput::AccountUuid(expected_uuid));
+    }
+
+    #[test]
+    fn p2pkh_taddr_classified_as_transparent_address() {
+        let parsed = parse_fromaddress(&mainnet(), MAINNET_P2PKH).unwrap();
+        match parsed {
+            FromAddressInput::TransparentAddress(TransparentAddress::PublicKeyHash(_)) => {}
+            other => panic!("Expected P2PKH TransparentAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p2sh_taddr_classified_as_transparent_address() {
+        let parsed = parse_fromaddress(&mainnet(), MAINNET_P2SH).unwrap();
+        match parsed {
+            FromAddressInput::TransparentAddress(TransparentAddress::ScriptHash(_)) => {}
+            other => panic!("Expected P2SH TransparentAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn testnet_taddr_classified_on_testnet() {
+        let parsed = parse_fromaddress(&testnet(), TESTNET_P2PKH).unwrap();
+        match parsed {
+            FromAddressInput::TransparentAddress(TransparentAddress::PublicKeyHash(_)) => {}
+            other => panic!("Expected testnet P2PKH TransparentAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mainnet_taddr_on_testnet_rejected() {
+        // Wrong network: mainnet t1 address parsed under testnet params is
+        // not a valid transparent address, so it should fail the parser with
+        // an InvalidParameter rather than an InvalidAddressOrKey.
+        let err = parse_fromaddress(&testnet(), MAINNET_P2PKH).unwrap_err();
+        assert_eq!(err.code(), LegacyCode::InvalidParameter as i32);
+    }
+
+    #[test]
+    fn sapling_shielded_address_rejected_as_non_transparent() {
+        let err = parse_fromaddress(&mainnet(), MAINNET_SAPLING).unwrap_err();
+        assert_eq!(err.code(), LegacyCode::InvalidAddressOrKey as i32);
+    }
+
+    #[test]
+    fn garbage_string_rejected() {
+        let err = parse_fromaddress(&mainnet(), "not-a-thing").unwrap_err();
+        assert_eq!(err.code(), LegacyCode::InvalidParameter as i32);
+    }
+
+    #[test]
+    fn empty_string_rejected() {
+        let err = parse_fromaddress(&mainnet(), "").unwrap_err();
+        assert_eq!(err.code(), LegacyCode::InvalidParameter as i32);
+    }
 }
